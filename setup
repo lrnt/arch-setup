@@ -1,0 +1,171 @@
+#!/bin/bash -e
+
+read -rp "Hostname: " hostname
+read -rp "Device: " device
+read -rp "Timezone: " timezone
+read -rp "Encrypt (0/1): " encrypt
+read -rp "Swap Size (GB): " swap_size
+
+case "$device" in
+*sd*)
+    boot_partition="$device"1
+    root_partition="$device"2
+    ;;
+*nvme*)
+    boot_partition="$device"p1
+    root_partition="$device"p2
+    ;;
+*)
+    echo "Unable to determine device partitions"
+    exit 1
+    ;;
+esac
+
+# Prepare disk
+sgdisk -Z "$device"
+sgdisk -o "$device"
+
+# Create boot partition
+sgdisk -n 1:0:200M "$device"
+sgdisk -t 1:ef00 "$device"
+
+# Create root partition
+sgdisk -n 2:0:0 "$device"
+sgdisk -t 2:8300 "$device"
+
+mountpoint=$(mktemp -d)
+
+volume_group_name="vg0"
+volume_root_path="$root_partition"
+
+# Encrypt root partition if specified
+if (( encrypt )); then
+    root_crypt_name="cryptroot"
+    root_crypt_path="/dev/mapper/$root_crypt_name"
+    volume_root_path="$root_crypt_path"
+
+    cryptsetup -y -v luksFormat "$root_partition"
+    cryptsetup luksOpen "$root_partition" "$root_crypt_name"
+fi
+
+# Create volume group
+pvcreate -ff "$volume_root_path"
+vgcreate "$volume_group_name" "$volume_root_path"
+
+# Create the root and swap volume
+root_volume_name="root"
+root_volume_path="/dev/mapper/$volume_group_name-$root_volume_name"
+
+swap_volume_name="swap"
+swap_volume_path="/dev/mapper/$volume_group_name-$swap_volume_name"
+
+if (( swap_size )); then
+    lvcreate -L "${swap_size}G" "$volume_group_name" --name $swap_volume_name
+fi
+
+lvcreate -l 100%FREE "$volume_group_name" --name $root_volume_name
+
+# Format partitions
+mkfs.vfat -F32 "$boot_partition"
+mkfs.ext4 "$root_volume_path"
+
+if (( swap_size )); then
+    mkswap "$swap_volume_path"
+fi
+
+# Mount root
+mount "$root_volume_path" "$mountpoint"
+
+# Mount boot
+mkdir -p "$mountpoint"/boot
+mount "$boot_partition" "$mountpoint"/boot
+
+# Test swap
+if (( swap_size )); then
+    swapon "$swap_volume_path"
+fi
+
+# Update repos and find the best mirrorlist
+pacman -Syy
+pacman --noconfirm --ignore pacman -S reflector
+
+reflector \
+    -c Belgium -c France -c Germany -c Netherlands \
+    -f 6 --protocol http --sort rate --save /etc/pacman.d/mirrorlist
+
+# Install Arch Linux
+pacstrap "$mountpoint" base base-devel syslinux
+
+# Copy mirrorlist
+cp /etc/pacman.d/mirrorlist "$mountpoint"/etc/pacman.d/mirrorlist
+
+# Set mkinitcpio hooks
+hooks=lvm2
+
+if (( encrypt )); then
+    hooks="encrypt $hooks"
+fi
+
+if (( swap_size )); then
+    hooks="$hooks resume"
+fi
+
+sed -i "/^HOOKS=/s/filesystems/$hooks &/" "$mountpoint"/etc/mkinitcpio.conf
+arch-chroot "$mountpoint" mkinitcpio -p linux
+
+# Set fstab
+genfstab -pU "$mountpoint" >> "$mountpoint"/etc/fstab
+
+# Set locale
+cat > "$mountpoint"/etc/locale.conf << 'EOF'
+LANG="en_IE.UTF-8"
+LANGUAGE="en_IE:nl_BE:fr_BE"
+EOF
+
+cat > "$mountpoint"/etc/locale.gen << 'EOF'
+en_IE.UTF-8 UTF-8
+nl_BE.UTF-8 UTF-8
+fr_BE.UTF-8 UTF-8
+EOF
+
+arch-chroot "$mountpoint" locale-gen
+
+# Set timezone
+arch-chroot "$mountpoint" ln -sf /usr/share/zoneinfo/"$timezone" /etc/localtime
+
+# Set hostname
+echo "$hostname" > "$mountpoint"/etc/hostname
+
+# Configure bootloader
+bootctl --path="$mountpoint"/boot install
+
+options_root="root=$root_volume_path"
+options_swap=""
+options_cryptdevice=""
+
+if (( encrypt )); then
+    uuid=$(blkid -s UUID -o value "$root_partition")
+    options_cryptdevice="cryptdevice=UUID=$uuid:$volume_group_name"
+fi
+
+if (( swap_size )); then
+    options_swap="resume=$swap_volume_path"
+fi
+
+options="$options_cryptdevice $options_root $options_swap quiet rw"
+
+cat > "$mountpoint"/boot/loader/entries/arch.conf << EOF
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options $options
+EOF
+
+cat > "$mountpoint"/boot/loader/loader.conf << 'EOF'
+default arch
+timeout 4
+editor  0
+EOF
+
+# Set root password
+while ! arch-chroot "$mountpoint" passwd; do :; done
